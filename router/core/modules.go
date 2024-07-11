@@ -12,8 +12,10 @@ import (
 	"go.uber.org/zap"
 )
 
+const MaxModulePriorities = 20
+
 var (
-	modules   = make(map[string]ModuleInfo)
+	modules   = make([]map[string]ModuleInfo, MaxModulePriorities)
 	modulesMu sync.RWMutex
 )
 
@@ -30,7 +32,21 @@ type Module interface {
 	Module() ModuleInfo
 }
 
+func init() {
+	for i := 0; i < MaxModulePriorities; i++ {
+		modules[i] = make(map[string]ModuleInfo)
+	}
+}
+
+// RegisterModule registers a module with the router with a priority of 10.
 func RegisterModule(instance Module) {
+	RegisterModuleWithPriority(instance, 10)
+}
+
+// RegisterModuleWithPriority registers a module with the router with the given priority. The priority
+// determines the order in which the modules are provisioned and cleaned up. Modules with a lower priority
+// are provisioned and cleaned up first.
+func RegisterModuleWithPriority(instance Module, priority int) {
 	mod := instance.Module()
 
 	if mod.ID == "" {
@@ -43,10 +59,14 @@ func RegisterModule(instance Module) {
 	modulesMu.Lock()
 	defer modulesMu.Unlock()
 
-	if _, ok := modules[string(mod.ID)]; ok {
-		panic(fmt.Sprintf("module already registered: %s", mod.ID))
+	// check if module already registered
+	for _, m := range modules {
+		if _, ok := m[string(mod.ID)]; ok {
+			panic(fmt.Sprintf("module already registered: %s", mod.ID))
+		}
 	}
-	modules[string(mod.ID)] = mod
+
+	modules[priority][string(mod.ID)] = mod
 }
 
 // Module Interfaces

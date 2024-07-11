@@ -6,6 +6,14 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"sync"
+	"time"
+
 	br "github.com/andybalholm/brotli"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -18,13 +26,6 @@ import (
 	"github.com/wundergraph/cosmo/router/pkg/otel"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/datasource/pubsub_datasource"
 	"golang.org/x/exp/maps"
-	"io"
-	"net"
-	"net/http"
-	"net/url"
-	"os"
-	"sync"
-	"time"
 
 	"github.com/nats-io/nuid"
 	"github.com/redis/go-redis/v9"
@@ -540,59 +541,61 @@ func (r *Router) updateServerAndStart(ctx context.Context, cfg *nodev1.RouterCon
 }
 
 func (r *Router) initModules(ctx context.Context) error {
-	for _, moduleInfo := range modules {
-		now := time.Now()
+	for priority, prioritizedModules := range modules {
+		for _, moduleInfo := range prioritizedModules {
+			now := time.Now()
 
-		moduleInstance := moduleInfo.New()
+			moduleInstance := moduleInfo.New()
 
-		mc := &ModuleContext{
-			Context: ctx,
-			Module:  moduleInstance,
-			Logger:  r.logger.With(zap.String("module", string(moduleInfo.ID))),
-		}
-
-		moduleConfig, ok := r.modulesConfig[string(moduleInfo.ID)]
-		if ok {
-			if err := mapstructure.Decode(moduleConfig, &moduleInstance); err != nil {
-				return fmt.Errorf("failed to decode module config from module %s: %w", moduleInfo.ID, err)
+			mc := &ModuleContext{
+				Context: ctx,
+				Module:  moduleInstance,
+				Logger:  r.logger.With(zap.String("module", string(moduleInfo.ID))),
 			}
-		} else {
-			r.logger.Debug("No config found for module", zap.String("id", string(moduleInfo.ID)))
-		}
 
-		if fn, ok := moduleInstance.(Provisioner); ok {
-			if err := fn.Provision(mc); err != nil {
-				return fmt.Errorf("failed to provision module '%s': %w", moduleInfo.ID, err)
+			moduleConfig, ok := r.modulesConfig[string(moduleInfo.ID)]
+			if ok {
+				if err := mapstructure.Decode(moduleConfig, &moduleInstance); err != nil {
+					return fmt.Errorf("failed to decode module config from module %s: %w", moduleInfo.ID, err)
+				}
+			} else {
+				r.logger.Debug("No config found for module", zap.String("id", string(moduleInfo.ID)))
 			}
-		}
 
-		if fn, ok := moduleInstance.(RouterMiddlewareHandler); ok {
-			r.routerMiddlewares = append(r.routerMiddlewares, func(handler http.Handler) http.Handler {
-				return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-					reqContext := getRequestContext(request.Context())
-					// Ensure we work with latest request in the chain to work with the right context
-					reqContext.request = request
-					fn.Middleware(reqContext, handler)
+			if fn, ok := moduleInstance.(Provisioner); ok {
+				if err := fn.Provision(mc); err != nil {
+					return fmt.Errorf("failed to provision module '%s': %w", moduleInfo.ID, err)
+				}
+			}
+
+			if fn, ok := moduleInstance.(RouterMiddlewareHandler); ok {
+				r.routerMiddlewares = append(r.routerMiddlewares, func(handler http.Handler) http.Handler {
+					return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+						reqContext := getRequestContext(request.Context())
+						// Ensure we work with latest request in the chain to work with the right context
+						reqContext.request = request
+						fn.Middleware(reqContext, handler)
+					})
 				})
-			})
+			}
+
+			if handler, ok := moduleInstance.(EnginePreOriginHandler); ok {
+				r.preOriginHandlers = append(r.preOriginHandlers, handler.OnOriginRequest)
+			}
+
+			if handler, ok := moduleInstance.(EnginePostOriginHandler); ok {
+				r.postOriginHandlers = append(r.postOriginHandlers, handler.OnOriginResponse)
+			}
+
+			r.modules = append(r.modules, moduleInstance)
+
+			r.logger.Info("Module registered",
+				zap.String("id", string(moduleInfo.ID)),
+				zap.Int("priority", priority),
+				zap.String("duration", time.Since(now).String()),
+			)
 		}
-
-		if handler, ok := moduleInstance.(EnginePreOriginHandler); ok {
-			r.preOriginHandlers = append(r.preOriginHandlers, handler.OnOriginRequest)
-		}
-
-		if handler, ok := moduleInstance.(EnginePostOriginHandler); ok {
-			r.postOriginHandlers = append(r.postOriginHandlers, handler.OnOriginResponse)
-		}
-
-		r.modules = append(r.modules, moduleInstance)
-
-		r.logger.Info("Module registered",
-			zap.String("id", string(moduleInfo.ID)),
-			zap.String("duration", time.Since(now).String()),
-		)
 	}
-
 	return nil
 }
 
